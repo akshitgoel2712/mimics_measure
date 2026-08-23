@@ -1,323 +1,730 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Created on Tue Apr 18 15:46:21 2023
-
-@author: akshitgoel
+Aortic Dissection Centerline Geometric Pipeline
+- Topological segment chaining for complex Mimics exports
+- Automatic proximal-to-distal orientation alignment
+- Coordinate standardization to origin (0, 0, 0)
+- Comparative Helical Twist: Local Polar Projection vs. Iterative Fiducial Guideline
 """
-
-import re
-import pandas as pd
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
+from scipy.signal import savgol_filter
 import math
-import numpy as np
+import os
+import re
 import warnings
-# WARNING INGORED
-warnings.simplefilter(action='ignore', category=FutureWarning)
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 
-file1 = "SR_005_Whole (2).txt"
-file2 = "SR_005_FL (2).txt"
-file3 = "SR_005_TL (2).txt"
+# Suppress pandas future warnings for cleaner terminal output
+warnings.simplefilter(action="ignore", category=FutureWarning)
 
-# Extracting fiducial point from whole aorta file
-with open(file1, "r") as file:
-    contents = file.read()
-    numbers = re.findall(r'(?<=X: )-?\d+(?:\.\d+)?|(?<=Y: )-?\d+(?:\.\d+)?|(?<=Z: )-?\d+(?:\.\d+)?', contents)
-    numbers = [float(n) for n in numbers]
-    point_coordinates = []
-    row = []
-    for number in numbers:
-        row.append(number)
-    point_coordinates = numbers
+# --- Global Constants & Configuration ---
+# Standard column names exported from Mimics centerline data
+COL_NAMES = [
+    "Px", "Py", "Pz",       # Position coordinates (3D spatial)
+    "Tx", "Ty", "Tz",       # Tangent vectors (direction of centerline)
+    "Nx", "Ny", "Nz",       # Normal vectors
+    "BNx", "BNy", "BNz",    # Binormal vectors
+    "Dfit", "Scf", "Area", "E", # Diameter of beset fit, distance of circumference, cross-sectional area, ellipticity
+]
 
-# Extracting properties from whole aorta file
-with open(file1, "r") as file:
-    lines = file.readlines()
-    numbers = []
-    for line in lines:
-        if not re.search(r'[a-zA-Z]', line):
-            numbers += re.findall(r'-?\d+(?:\.\d+)?', line)
-    numbers = [float(n) for n in numbers]
-    whole_aorta = []
-    row = []
-    for number in numbers:
-        row.append(number)
-        if len(row) == 16:  
-            whole_aorta.append(row)
-            row = []
-    whole_aorta = pd.DataFrame(whole_aorta, columns=["Px", "Py", "Pz", "Tx", "Ty", "Tz", "Nx", "Ny", "Nz", "BNx", "BNy", "BNz","Dfit", "Scf", "Area", "E"])
-    # Remove anomalous points from DataFrame
-    mean = np.mean(whole_aorta['Dfit'])
-    std = np.std(whole_aorta['Dfit'])
-    mask = abs(whole_aorta['Dfit'] - mean) > 3*std
-    whole_aorta = whole_aorta.drop(whole_aorta[mask].index)
-    whole_aorta = whole_aorta.reset_index(drop=True)
-    # Reversing order of dataframe
-    # whole_aorta = whole_aorta.iloc[::-1]
+EPSILON = 1e-9             # Small value to prevent division by zero in vector math
+DISTANCE_TOLERANCE = 25.0  # Search tolerance in mm for mapping lumen points
 
-# Extracting properties from FL file
-with open(file2, "r") as file:
-    lines = file.readlines()
-    numbers = []
-    for line in lines:
-        if not re.search(r'[a-zA-Z]', line):
-            numbers += re.findall(r'-?\d+(?:\.\d+)?', line)
-    numbers = [float(n) for n in numbers]
-    FL_aorta = []
-    row = []
-    for number in numbers:
-        row.append(number)
-        if len(row) == 16:  
-            FL_aorta.append(row)
-            row = []
-    FL_aorta = pd.DataFrame(FL_aorta, columns=["Px", "Py", "Pz", "Tx", "Ty", "Tz", "Nx", "Ny", "Nz", "BNx", "BNy", "BNz","Dfit", "Scf", "Area", "E"])
-    # Remove anomalous points from DataFrame
-    mean = np.mean(FL_aorta['Dfit'])
-    std = np.std(FL_aorta['Dfit'])
-    mask = abs(FL_aorta['Dfit'] - mean) > 3*std
-    FL_aorta = FL_aorta.drop(FL_aorta[mask].index)
-    FL_aorta = FL_aorta.reset_index(drop=True)
+# --- Batch File Processing ---
+def get_file_batches(directory="."):
+    """
+    Scans a directory and groups centerline text files into processing batches.
+    Expects files to be named with a common prefix and a specific suffix 
+    (e.g., 'Patient1_Whole.txt', 'Patient1_FL.txt', 'Patient1_TL.txt').
+    """
+    batches = {}
+    pattern = re.compile(r"^(.*?)_(FL|TL|Whole)( \(\d+\))?\.txt$")
+    
+    for filename in os.listdir(directory):
+        match = pattern.match(filename)
+        if match:
+            prefix = match.group(1)
+            lumen_type = match.group(2)
+            suffix = match.group(3) if match.group(3) else ""
+            
+            batch_id = f"{prefix}{suffix}"
+            
+            if batch_id not in batches:
+                batches[batch_id] = {}
+            batches[batch_id][lumen_type] = os.path.join(directory, filename)
+            
+    # Filter for only complete batches (must have Whole, FL, and TL files)
+    complete_batches = {k: v for k, v in batches.items() if all(l in v for l in ['Whole', 'FL', 'TL'])}
+    return complete_batches
 
-# Extracting properties from TL file
-with open(file3, "r") as file:
-    lines = file.readlines()
-    numbers = []
-    for line in lines:
-        if not re.search(r'[a-zA-Z]', line):
-            numbers += re.findall(r'-?\d+(?:\.\d+)?', line)
-    numbers = [float(n) for n in numbers]
-    TL_aorta = []
-    row = []
-    for number in numbers:
-        row.append(number)
-        if len(row) == 16:  
-            TL_aorta.append(row)
-            row = []
-    TL_aorta = pd.DataFrame(TL_aorta, columns=["Px", "Py", "Pz", "Tx", "Ty", "Tz", "Nx", "Ny", "Nz", "BNx", "BNy", "BNz","Dfit", "Scf", "Area", "E"])
-    mean = np.mean(TL_aorta['Dfit'])
-    std = np.std(TL_aorta['Dfit'])
-    mask = abs(TL_aorta['Dfit'] - mean) > 5*std
-    TL_aorta = TL_aorta.drop(TL_aorta[mask].index)
-    TL_aorta = TL_aorta.reset_index(drop=True)
+# --- Robust Data Loading & Topological Segment Chaining ---
+def extract_fiducial_point(filename):
+    """
+    Extracts the initial X, Y, Z spatial coordinates from the text header 
+    to use as a proximal anatomical anchor (e.g., Left Subclavian Artery).
+    """
+    with open(filename, "r") as file:
+        contents = file.read()
+    coords = re.findall(
+        r"(?<=X:\s)-?\d+(?:\.\d+)?|(?<=Y:\s)-?\d+(?:\.\d+)?|(?<=Z:\s)-?\d+(?:\.\d+)?",
+        contents,
+    )
+    if len(coords) < 3:
+        coords = re.findall(r"-?\d+\.\d+", contents[:200])
+    return [float(c) for c in coords[:3]]
 
-# Creating the fiducial line
-def fiducial_line(whole_aorta, point_coordinates):
-    scale_factor = math.sqrt((point_coordinates[0] - whole_aorta.iloc[0, 0])**2 + (point_coordinates[1] - whole_aorta.iloc[0, 1])**2 + (point_coordinates[2] - whole_aorta.iloc[0, 2])**2)/(whole_aorta.iloc[0, 12]/2)
-    fiducial_points = []
-    for index, row in whole_aorta.iterrows():
-        num_rows = whole_aorta.shape[0] - 1
-        # new_index = num_rows - index
-        new_index = index
-        if new_index == 0:
-            fiducial_points.append(point_coordinates)
-        else:
-            # Finding intersection point
-            a = new_index - 1
-            b = new_index
-            v0 = -1*np.array([whole_aorta.iloc[a, 3], whole_aorta.iloc[a, 4], whole_aorta.iloc[a, 5]])
-            v1 = -1*np.array([whole_aorta.iloc[b, 3], whole_aorta.iloc[b, 4], whole_aorta.iloc[b, 5]])
-            origin = np.array([whole_aorta.iloc[b, 0], whole_aorta.iloc[b, 1], whole_aorta.iloc[b, 2]])
-            t1 = (np.dot((origin-fiducial_points[a]), v1)/(np.dot(v0, v1)))
-            intersection = fiducial_points[a] + t1*v0
-            # Finding point at a certain distance
-            direction = intersection - origin
-            direction_normalized = direction/np.linalg.norm(direction)
-            distance = (whole_aorta.iloc[b,12]/2)*scale_factor
-            new_point = origin + (distance * direction_normalized)
-            # Adding new point to array
-            fiducial_points.append(new_point)
-    fiducial_points = pd.DataFrame(fiducial_points, columns=["Px", "Py", "Pz"])
-    return fiducial_points
+def load_centerline(filename, sigma_cutoff=3.0):
+    """
+    Parses the text file, chains disjointed segments together based on spatial proximity,
+    and removes outliers using standard deviation cutoffs on best-fit diameters.
+    """
+    segments = {}
+    current_seg_id = None
+    current_rows = []
 
-# Finding where a plane drawn on the whole aorta intersects a different lumen
-def point_finder(index, whole_aorta, lumen):
-    smallest_pos_distance = np.inf
-    smallest_pos_point_distance = 20
-    smallest_pos_point = None
-    smallest_neg_distance = -np.inf
-    smallest_neg_point_distance = 20
-    smallest_neg_point = None
-    normal_vector = -1*np.array([whole_aorta.iloc[index,3], whole_aorta.iloc[index, 4], whole_aorta.iloc[index,5]])
-    origin = np.array([whole_aorta.iloc[index, 0], whole_aorta.iloc[index, 1], whole_aorta.iloc[index, 2]])
-    d = -np.dot(normal_vector, origin)
-    # Iterating through the dataframe lumen to find the closest points above and below the plane
-    for index, row in lumen.iterrows():
-        point = np.array([row['Px'], row['Py'], row['Pz']])
-        distance = (np.dot(normal_vector, point) + d) / np.linalg.norm(normal_vector)
-        distance1 = math.sqrt((point[0] - origin[0])**2 + (point[1] - origin[1])**2 + (point[2] - origin[2])**2)
-        if distance > 0 and distance < smallest_pos_distance:
-            if distance1 < smallest_pos_point_distance:
-                smallest_pos_distance = distance
-                smallest_pos_point_distance = distance1
-                smallest_pos_point = point
-        elif distance < 0 and distance > smallest_neg_distance:
-            if distance1 < smallest_neg_point_distance:
-                smallest_neg_distance = distance
-                smallest_neg_point_distance = distance1
-                smallest_neg_point = point
-    # Finding where a line between the two points intersects the plane unless only one point exists
-    if (np.any(smallest_neg_point) == True) and (np.any(smallest_pos_point) == True):
-        v = smallest_neg_point - smallest_pos_point
-        t = np.dot(normal_vector, (origin - smallest_pos_point)) / np.dot(normal_vector, v)
-        new_point = smallest_pos_point + t * v
-    else:
-        new_point = ["na", "na", "na"]
-    return(new_point)
+    # 1. Parse the text file into segments
+    with open(filename, "r") as f:
+        for line in f:
+            line_str = line.strip()
 
-# Finding all the points that match normal planes to the whole aorta
-def lumen_points(whole_aorta, lumen):
-    lumen_points = []
-    for index, row in whole_aorta.iterrows():
-        point = point_finder(index, whole_aorta, lumen)
-        lumen_points.append(point)
-    lumen_points = pd.DataFrame(lumen_points, columns=["Px", "Py", "Pz"])
-    lumen_points = lumen_points.iloc[::-1]
-    return(lumen_points)
+            seg_match = re.search(r"Branch Segment (\d+):", line_str)
+            if seg_match:
+                if current_seg_id is not None and current_rows:
+                    segments[current_seg_id] = current_rows
+                current_seg_id = int(seg_match.group(1))
+                current_rows = []
+                continue
 
-# Finding all helical angles for a given lumen
-def helical_angle(whole_aorta, lumen):
-    plane_points = lumen_points(whole_aorta, lumen)
-    fiducial = fiducial_line(whole_aorta, point_coordinates)
-    helical_angles = []
-    for index, row in whole_aorta.iterrows():
-        A = np.array([row['Px'], row['Py'], row['Pz']])
-        B = np.array([fiducial.iloc[index, 0], fiducial.iloc[index, 1], fiducial.iloc[index, 2]])
-        C = np.array([plane_points.iloc[index, 0], plane_points.iloc[index, 1], plane_points.iloc[index, 2]])
-        arr = ["na", "na", "na"]
-        if not np.array_equal(C, arr):
-            AB = B - A
-            AC = C - A
-            dot_product = np.dot(AB, AC)
-            cross_product = np.cross(AB, AC)
-            angle = np.arctan2(np.linalg.norm(cross_product), dot_product)
-            angle_degrees = np.sign(np.dot(cross_product, np.array([0, 0, 1]))) * np.degrees(angle)
-            # mag_AB = np.linalg.norm(AB)
-            # mag_AC = np.linalg.norm(AC)
-            # angle = np.arccos(dot_product / (mag_AB * mag_AC))
-            # angle_degrees = np.degrees(angle)
-            helical_angles.append(angle_degrees)
-    # print(helical_angles)
-    return(helical_angles)
+            tokens = line_str.split()
+            if len(tokens) == len(COL_NAMES):
+                if tokens[0] == "Px":
+                    continue
+                parsed = []
+                for t in tokens:
+                    if t.lower() in ["n/a", "na", "nan", "null"]:
+                        parsed.append(np.nan)
+                    else:
+                        try:
+                            parsed.append(float(t))
+                        except ValueError:
+                            parsed.append(np.nan)
+                if len(parsed) == len(COL_NAMES) and not np.isnan(parsed[0]):
+                    current_rows.append(parsed)
 
-def helical_results(lumen):
-    helical_data = helical_angle(whole_aorta, lumen)
-    change = np.diff(helical_data)
-    if np.max(change) > abs(np.min(change)):
-        max_change = np.max(change)
-    else:
-        max_change = np.min(change)
-    average_angle = "Avg angle", np.mean(helical_data)
-    sd_angle = "Sd angle",np.std(helical_data)
-    average_twist = "Avg twist", np.mean(change)
-    sd_twist = "Sd twist",np.std(change)
-    peak_twist = "Peak twist", max_change
-    return(average_angle, sd_angle, average_twist, sd_twist, peak_twist)
+    if current_seg_id is not None and current_rows:
+        segments[current_seg_id] = current_rows
 
-# Finding results
-def results(aorta):
-    max_diameter = "Max Dfit", aorta['Dfit'].max()
-    diameter_avg = "Avg Dfit", aorta['Dfit'].mean()
-    diameter_sd = "Sd Dfit", aorta['Dfit'].std()
-    Scf_avg = "Avg Scf", aorta['Scf'].mean()
-    Scf_sd = "Sd Scf", aorta['Scf'].std()
-    area_avg = "Avg area", aorta['Area'].mean()
-    area_sd = "Sd area", aorta['Area'].std()
-    E_avg = "Avg E", aorta['E'].mean()
-    E_sd = "Sd E", aorta['E'].std()
+    if not segments:
+        return pd.DataFrame(columns=COL_NAMES)
 
-    return max_diameter, diameter_avg, diameter_sd, Scf_avg, Scf_sd, area_avg, area_sd, E_avg, E_sd
+    # 2. Topologically chain the segments based on nearest endpoints
+    ordered_segments = []
+    available_keys = list(segments.keys())
 
-# Exporting results to CSV file
-def csv(aorta, FL, TL):
-    helical_data1 = helical_angle(whole_aorta, FL)
-    change1 = np.diff(helical_data1)
-    if np.max(change1) > abs(np.min(change1)):
-        max_change1 = np.max(change1)
-    else:
-        max_change1 = np.min(change1)
-    helical_data2 = helical_angle(whole_aorta, TL)
-    change2 = np.diff(helical_data2)
-    if np.max(change2) > abs(np.min(change2)):
-        max_change2 = np.max(change2)
-    else:
-        max_change2 = np.min(change2)
-    data = {'Whole Max Dfit': aorta['Dfit'].max(),
-            'Whole Avg Dfit': aorta['Dfit'].mean(),
-            'Whole Sd dfit': aorta['Dfit'].std(),
-            'Whole Avg Scf': aorta['Scf'].mean(),
-            'Whole Sd Scf': aorta['Scf'].std(),
-            'Whole Avg area': aorta['Area'].mean(),
-            'Whole Sd area': aorta['Area'].std(),
-            'Whole Avg E': aorta['E'].mean(),
-            'Whole Sd E': aorta['E'].std(),
-            'FL Max Dfit': FL['Dfit'].max(),
-            'FL Avg Dfit': FL['Dfit'].mean(),
-            'Fl Sd dfit': FL['Dfit'].std(),
-            'FL Avg Scf': FL['Scf'].mean(),
-            'FL Sd Scf': FL['Scf'].std(),
-            'FL Avg area': FL['Area'].mean(),
-            'FL Sd area': FL['Area'].std(),
-            'FL Avg E': FL['E'].mean(),
-            'FL Sd E': FL['E'].std(),
-            'FL Avg angle': np.mean(helical_data1),
-            'FL SD angle': np.std(helical_data1),
-            'FL Avg twist': np.mean(change1),
-            'FL Sd twist': np.std(change1),
-            'FL peak twist': max_change1,
-            'TL Max Dfit': TL['Dfit'].max(),
-            'TL Avg Dfit': TL['Dfit'].mean(),
-            'Tl Sd dfit': TL['Dfit'].std(),
-            'TL Avg Scf': TL['Scf'].mean(),
-            'TL Sd Scf': TL['Scf'].std(),
-            'TL Avg area': TL['Area'].mean(),
-            'TL Sd area': TL['Area'].std(),
-            'TL Avg E': TL['E'].mean(),
-            'TL Sd E': TL['E'].std(),
-            'TL Avg angle': np.mean(helical_data2),
-            'TL SD angle': np.std(helical_data2),
-            'TL Avg twist': np.mean(change2),
-            'TL Sd twist': np.std(change2),
-            'TL peak twist': max_change2}
-    df = pd.DataFrame(data, index=[0])
+    current_key = available_keys.pop(0)
+    ordered_segments.append(np.array(segments[current_key]))
+
+    while available_keys:
+        last_pt = ordered_segments[-1][-1, :3]
+        best_key = None
+        best_dist = np.inf
+        flip_needed = False
+
+        for k in available_keys:
+            seg_pts = np.array(segments[k])
+            d_start = np.linalg.norm(seg_pts[0, :3] - last_pt)
+            d_end = np.linalg.norm(seg_pts[-1, :3] - last_pt)
+
+            if d_start < best_dist:
+                best_dist = d_start
+                best_key = k
+                flip_needed = False
+            if d_end < best_dist:
+                best_dist = d_end
+                best_key = k
+                flip_needed = True
+
+        # Break if the next segment is too far away (likely an artifact branch)
+        if best_dist > 50.0 or best_key is None:
+            break
+
+        next_seg = np.array(segments[best_key])
+        if flip_needed:
+            next_seg = np.flip(next_seg, axis=0)
+
+        ordered_segments.append(next_seg)
+        available_keys.remove(best_key)
+
+    full_data = np.vstack(ordered_segments)
+    df = pd.DataFrame(full_data, columns=COL_NAMES)
+
+    # 3. Clean duplicates and interpolate missing diameters
+    dup_mask = (df[["Px", "Py", "Pz"]].diff().abs() < 1e-4).all(axis=1)
+    df = df[~dup_mask].reset_index(drop=True)
+
+    if df["Dfit"].isna().any():
+        df["Dfit"] = df["Dfit"].interpolate(method="linear").bfill().ffill()
+
+    # 4. Remove spatial outliers based on standard deviation
+    mean_d = df["Dfit"].mean()
+    std_d = df["Dfit"].std()
+    if std_d > 0:
+        mask = abs(df["Dfit"] - mean_d) <= sigma_cutoff * std_d
+        df = df[mask].reset_index(drop=True)
+
     return df
 
-# Plotting 3 graphs on a 3D axis
-def plots(dataframe1, dataframe2, dataframe3):
-    fig = plt.figure()
-    ax = fig.add_subplot(111, projection='3d')
+# --- Anatomical Orientation ---
+def orient_proximal_to_distal(df, fiducial_init):
+    """
+    Ensures the 3D centerline flows from the proximal aorta to the distal bifurcation.
+    If the endpoint is closer to the fiducial origin than the start point, the array is flipped.
+    """
+    if len(df) == 0:
+        return df
 
-    x1 = dataframe1.iloc[:, 0]
-    y1 = dataframe1.iloc[:, 1]
-    z1 = dataframe1.iloc[:, 2]
-    x2 = dataframe2.iloc[:, 0]
-    y2 = dataframe2.iloc[:, 1]
-    z2 = dataframe2.iloc[:, 2]
-    x3 = dataframe3.iloc[:, 0]
-    y3 = dataframe3.iloc[:, 1]
-    z3 = dataframe3.iloc[:, 2]
+    init_pt = np.array(fiducial_init, dtype=float)
+    pt_start = df.iloc[0][["Px", "Py", "Pz"]].to_numpy(dtype=float)
+    pt_end = df.iloc[-1][["Px", "Py", "Pz"]].to_numpy(dtype=float)
+
+    if np.linalg.norm(pt_end - init_pt) < np.linalg.norm(pt_start - init_pt):
+        df = df.iloc[::-1].reset_index(drop=True)
+        # Reverse vectors accordingly
+        df["Tx"] = -df["Tx"]
+        df["Ty"] = -df["Ty"]
+        df["Tz"] = -df["Tz"]
+        df["BNx"] = -df["BNx"]
+        df["BNy"] = -df["BNy"]
+        df["BNz"] = -df["BNz"]
+
+    return df
+
+# --- Standardization ---
+def standardize_coordinates(whole, fl, tl, fiducial_init, scale_by="diameter"):
+    """Translates spatial coordinates to a standard origin (0,0,0) and applies scaling."""
+    origin = whole.iloc[0][["Px", "Py", "Pz"]].to_numpy(dtype=float)
+
+    if scale_by == "diameter":
+        scale_val = float(whole.iloc[0]["Dfit"])
+    elif scale_by == "length":
+        diffs = whole[["Px", "Py", "Pz"]].diff().dropna().to_numpy()
+        scale_val = float(np.sum(np.linalg.norm(diffs, axis=1)))
+    else:
+        scale_val = 1.0
+
+    if abs(scale_val) < EPSILON:
+        scale_val = 1.0
+
+    def transform_df(df):
+        df_mod = df.copy()
+        df_mod["Px"] = (df_mod["Px"] - origin[0]) / scale_val
+        df_mod["Py"] = (df_mod["Py"] - origin[1]) / scale_val
+        df_mod["Pz"] = (df_mod["Pz"] - origin[2]) / scale_val
+        return df_mod
+
+    whole_std = transform_df(whole)
+    fl_std = transform_df(fl)
+    tl_std = transform_df(tl)
+    fiducial_init_std = (np.array(fiducial_init, dtype=float) - origin) / scale_val
+
+    return whole_std, fl_std, tl_std, fiducial_init_std.tolist(), scale_val
+
+# --- Geometric Calculations ---
+def fiducial_line(whole_aorta, point_coordinates, scale_val):
+    """
+    Constructs a longitudinal reference guideline to decouple luminal twist from whole-vessel bending.
+    Iteratively projects a stable reference point forward along the parent vessel's tangent path.
+    """
+    origin_0 = whole_aorta.iloc[0][["Px", "Py", "Pz"]].to_numpy(dtype=float)
+    init_pt = np.array(point_coordinates, dtype=float)
+
+    d_fit_0_spatial = (whole_aorta.iloc[0]["Dfit"] / scale_val) / 2.0
+    r0 = d_fit_0_spatial if abs(d_fit_0_spatial) > EPSILON else 1.0
+    dist_to_start = np.linalg.norm(init_pt - origin_0)
     
-    for index, row in dataframe1.iloc[::5].iterrows():
-        ax.scatter(dataframe1.iloc[index, 0], dataframe1.iloc[index, 1], dataframe1.iloc[index, 2], c='k', marker='x')
-        ax.scatter(dataframe2.iloc[index, 0], dataframe2.iloc[index, 1], dataframe2.iloc[index, 2], c='g', marker='x')
-        ax.scatter(dataframe3.iloc[index, 0], dataframe3.iloc[index, 1], dataframe3.iloc[index, 2], c='b', marker='x')
-    ax.plot(x1, y1, z1, c='k', label='whole')
-    ax.plot(x2, y2, z2, c='g', label='fiducial')
-    ax.plot(x3, y3, z3, c='b', label='TL')
-    ax.legend()
-    ax.set_xlabel('x')
-    ax.set_ylabel('y')
-    ax.set_zlabel('z')
+    # Establish baseline normal if fiducial point is out of bounds
+    if dist_to_start > 3.0 * r0:
+        normal_0 = whole_aorta.iloc[0][["Nx", "Ny", "Nz"]].to_numpy(dtype=float)
+        if np.isnan(normal_0).any() or np.linalg.norm(normal_0) < EPSILON:
+            t0 = whole_aorta.iloc[0][["Tx", "Ty", "Tz"]].to_numpy(dtype=float)
+            ref = np.array([0.0, 0.0, 1.0]) if abs(t0[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+            normal_0 = np.cross(t0, ref)
+        normal_0 = normal_0 / np.linalg.norm(normal_0)
+        fiducial_points = [origin_0 + r0 * normal_0]
+    else:
+        fiducial_points = [init_pt]
 
-# helical_angles1 = helical_angle(whole_aorta, FL_aorta)
-fiducial = fiducial_line(whole_aorta, point_coordinates)
-plots(whole_aorta, fiducial, FL_aorta)
+    scale_factor = np.linalg.norm(fiducial_points[0] - origin_0) / r0
 
-df = csv(whole_aorta, FL_aorta, TL_aorta)
-df.to_csv('output.csv', index=False)
-# print("Whole aorta\n",results(whole_aorta))
-# print("FL aorta\n", results(FL_aorta))
-# print(helical_results(FL_aorta))
-# print("TL aorta\n", results(TL_aorta))
-# print(helical_results(TL_aorta))
+    # Iteratively project guideline along the centerline
+    for index in range(1, len(whole_aorta)):
+        a = index - 1
+        b = index
+        v0 = -1.0 * whole_aorta.iloc[a][["Tx", "Ty", "Tz"]].to_numpy(dtype=float)
+        v1 = -1.0 * whole_aorta.iloc[b][["Tx", "Ty", "Tz"]].to_numpy(dtype=float)
+        origin_b = whole_aorta.iloc[b][["Px", "Py", "Pz"]].to_numpy(dtype=float)
 
+        dot_v0_v1 = np.dot(v0, v1)
+        if abs(dot_v0_v1) < EPSILON:
+            dot_v0_v1 = EPSILON if dot_v0_v1 >= 0 else -EPSILON
+
+        t1 = np.dot((origin_b - fiducial_points[a]), v1) / dot_v0_v1
+        intersection = fiducial_points[a] + t1 * v0
+
+        direction = intersection - origin_b
+        norm_dir = np.linalg.norm(direction)
+        direction_normalized = direction / (norm_dir + EPSILON) if norm_dir > 0 else np.zeros_like(direction)
+
+        distance = ((whole_aorta.iloc[b]["Dfit"] / scale_val) / 2.0) * scale_factor
+        new_point = origin_b + (distance * direction_normalized)
+        fiducial_points.append(new_point)
+
+    return pd.DataFrame(fiducial_points, columns=["Px", "Py", "Pz"])
+
+def point_finder(index, whole_aorta, lumen_pts, search_radius):
+    """Locates the nearest valid lumen point orthogonally mapped to the whole aorta's centerline frame."""
+    normal_vector = -1.0 * whole_aorta.iloc[index][["Tx", "Ty", "Tz"]].to_numpy(dtype=float)
+    origin = whole_aorta.iloc[index][["Px", "Py", "Pz"]].to_numpy(dtype=float)
+
+    norm_mag = np.linalg.norm(normal_vector) + EPSILON
+    d = -np.dot(normal_vector, origin)
+
+    plane_distances = (np.dot(lumen_pts, normal_vector) + d) / norm_mag
+    point_distances = np.linalg.norm(lumen_pts - origin, axis=1)
+
+    pos_mask = (plane_distances > 0) & (point_distances < search_radius)
+    neg_mask = (plane_distances < 0) & (point_distances < search_radius)
+
+    # Intersect the lumen with the orthogonal plane
+    if np.any(pos_mask) and np.any(neg_mask):
+        pos_indices = np.where(pos_mask)[0]
+        neg_indices = np.where(neg_mask)[0]
+
+        best_pos_idx = pos_indices[np.argmin(plane_distances[pos_indices])]
+        best_neg_idx = neg_indices[np.argmax(plane_distances[neg_indices])]
+
+        smallest_pos_point = lumen_pts[best_pos_idx]
+        smallest_neg_point = lumen_pts[best_neg_idx]
+
+        v = smallest_neg_point - smallest_pos_point
+        v_dot_n = np.dot(normal_vector, v)
+        if abs(v_dot_n) < EPSILON:
+            v_dot_n = EPSILON if v_dot_n >= 0 else -EPSILON
+
+        t = np.dot(normal_vector, (origin - smallest_pos_point)) / v_dot_n
+        return smallest_pos_point + t * v
+    return [np.nan, np.nan, np.nan]
+
+def lumen_points(whole_aorta, lumen, search_radius):
+    """Maps all true/false lumen points along the parent aorta's coordinate frame."""
+    lumen_pts = lumen[["Px", "Py", "Pz"]].to_numpy(dtype=float)
+    matched_pts = [point_finder(i, whole_aorta, lumen_pts, search_radius=search_radius) for i in range(len(whole_aorta))]
+    df = pd.DataFrame(matched_pts, columns=["Px", "Py", "Pz"])
+    return df
+
+def calculate_arc_length(df):
+    """Calculates the cumulative Euclidean distance (in mm) along the 3D centerline."""
+    pts = df[["Px", "Py", "Pz"]].to_numpy(dtype=float)
+    distances = np.zeros(len(pts))
+    distances[1:] = np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))
+    return distances
+
+def calculate_tortuosity(df):
+    """Calculates Tortuosity Index: total Arc Length divided by direct Chord Length."""
+    pts = df[["Px", "Py", "Pz"]].to_numpy(dtype=float)
+    if len(pts) < 2:
+        return np.nan
+    arc_length = np.sum(np.linalg.norm(np.diff(pts, axis=0), axis=1))
+    chord_length = np.linalg.norm(pts[-1] - pts[0])
+    return arc_length / chord_length if chord_length > EPSILON else np.nan
+
+def calculate_mean_curvature(df, distances_mm):
+    """Calculates the average local curvature (kappa) using tangent differentials."""
+    T = df[["Tx", "Ty", "Tz"]].to_numpy(dtype=float)
+    if len(T) < 2:
+        return np.nan
+        
+    dT = np.linalg.norm(np.diff(T, axis=0), axis=1)
+    ds = np.diff(distances_mm)
+    
+    # Protect against zero distance steps (duplicate points)
+    valid_steps = ds > 1e-6
+    if not np.any(valid_steps):
+        return np.nan
+        
+    curvature = dT[valid_steps] / ds[valid_steps]
+    return np.nanmean(curvature)
+
+def calculate_volume(areas, distances_mm):
+    """Calculates Segmental Volumes using 3D Frustum Integration."""
+    areas = np.array(areas, dtype=float)
+    valid = ~np.isnan(areas) & ~np.isnan(distances_mm)
+    areas, distances = areas[valid], distances_mm[valid]
+    
+    if len(areas) < 2:
+        return 0.0
+        
+    dz = np.diff(distances)
+    A1, A2 = areas[:-1], areas[1:]
+    
+    # Frustum Volume Formula: V = (1/3) * (A1 + A2 + sqrt(A1*A2)) * dz
+    volumes = (1.0 / 3.0) * (A1 + A2 + np.sqrt(A1 * A2)) * dz
+    return np.sum(volumes)
+
+# METHOD 1: Iterative Fiducial Guideline (Bondesson Method)
+def helical_angle_fiducial(whole_aorta, lumen, point_coords, scale_val, search_radius):
+    """Computes spatial twist referenced against the stable longitudinal fiducial guideline."""
+    plane_points = lumen_points(whole_aorta, lumen, search_radius)
+    fiducial = fiducial_line(whole_aorta, point_coords, scale_val)
+    helical_angles = []
+    
+    for i in range(len(whole_aorta)):
+        A = whole_aorta.iloc[i][["Px", "Py", "Pz"]].to_numpy(dtype=float)
+        B = fiducial.iloc[i][["Px", "Py", "Pz"]].to_numpy(dtype=float)
+        C = plane_points.iloc[i][["Px", "Py", "Pz"]].to_numpy(dtype=float)
+        T = whole_aorta.iloc[i][["Tx", "Ty", "Tz"]].to_numpy(dtype=float)
+        
+        if np.isnan(C).any() or np.isnan(T).any():
+            helical_angles.append(np.nan)
+            continue
+            
+        AB = B - A
+        AC = C - A
+        dot_product = np.dot(AB, AC)
+        cross_product = np.cross(AB, AC)
+        
+        angle = np.arctan2(np.dot(T, cross_product), dot_product)
+        helical_angles.append(np.degrees(angle))
+        
+    return np.array(helical_angles)
+
+# METHOD 2: Local 2D Polar Projection
+def helical_angle_polar(whole_aorta, lumen, search_radius):
+    """Computes spatial twist using standard 2D polar mapping (prone to frame-rotation artifacts)."""
+    plane_points = lumen_points(whole_aorta, lumen, search_radius)
+    helical_angles = []
+    
+    for i in range(len(whole_aorta)):
+        P = whole_aorta.iloc[i][["Px", "Py", "Pz"]].to_numpy(dtype=float)
+        N = whole_aorta.iloc[i][["Nx", "Ny", "Nz"]].to_numpy(dtype=float)
+        B = whole_aorta.iloc[i][["BNx", "BNy", "BNz"]].to_numpy(dtype=float)
+        C = plane_points.iloc[i][["Px", "Py", "Pz"]].to_numpy(dtype=float)
+        
+        if np.isnan(C).any() or np.isnan(N).any() or np.isnan(B).any():
+            helical_angles.append(np.nan)
+            continue
+            
+        vec = C - P
+        x = np.dot(vec, N)
+        y = np.dot(vec, B)
+        
+        angle = np.degrees(np.arctan2(y, x))
+        helical_angles.append(angle)
+        
+    return np.array(helical_angles)
+
+def determine_chirality(max_pos, max_neg, threshold=1.5):
+    """Classifies geometric chirality based on extrema of local twist rate."""
+    has_right = max_pos >= threshold
+    has_left = max_neg <= -threshold
+    
+    if has_right and has_left:
+        return "Mixed-Chiral"
+    elif has_right:
+        return "Right-Chiral"
+    elif has_left:
+        return "Left-Chiral"
+    else:
+        return "Non-Helical"
+    
+def extract_metrics(angles, distances_mm):
+    """
+    Extracts twist metrics, addressing missing data gaps and applying 
+    a dynamically scaled Savitzky-Golay smoothing filter to handle segmentation voxelation.
+    """
+    valid_mask = ~np.isnan(angles)
+    valid_angles = angles[valid_mask]
+    valid_distances = distances_mm[valid_mask]
+    
+    if len(valid_angles) < 2:
+        return np.nan, np.nan, np.nan, np.nan, np.nan, np.nan
+    
+    # Unwrap the phase (fix the 360-degree artificial jumps)
+    unwrapped_angles = np.unwrap(valid_angles, period=360)
+    
+    # NEW: Apply Savitzky-Golay smoothing filter safely
+    n_points = len(unwrapped_angles)
+    
+    # Safely calculate the largest odd integer <= array length (max 11)
+    if n_points >= 11:
+        window = 11
+    else:
+        window = n_points if n_points % 2 != 0 else n_points - 1
+    
+    # S-G requires window size > polyorder.
+    if window >= 3:
+        poly = 3 if window >= 5 else 1
+        smoothed_angles = savgol_filter(unwrapped_angles, window_length=window, polyorder=poly)
+    else:
+        smoothed_angles = unwrapped_angles
+    
+    # Calculate physical spatial twist rate using SMOOTHED angles
+    angle_change = np.diff(smoothed_angles)
+    distance_change = np.diff(valid_distances)
+    
+    valid_steps = distance_change > 1e-3
+    if not np.any(valid_steps):
+        return np.mean(unwrapped_angles), np.nan, np.nan, np.nan, np.nan, np.nan
+        
+    twist_rate = angle_change[valid_steps] / distance_change[valid_steps]
+    
+    # Extract metrics cleanly using absolute max/min
+    peak_twist = twist_rate[np.argmax(np.abs(twist_rate))]
+    avg_twist = np.mean(twist_rate)
+    sd_twist = np.std(twist_rate)
+    
+    max_pos_twist = np.max(twist_rate) if np.any(twist_rate > 0) else 0.0
+    max_neg_twist = np.min(twist_rate) if np.any(twist_rate < 0) else 0.0
+        
+    return np.mean(unwrapped_angles), avg_twist, sd_twist, peak_twist, max_pos_twist, max_neg_twist
+
+def csv(batch_id, aorta, FL, TL, point_coords, scale_val, search_radius, whole_raw, fl_raw, tl_raw, make_plots):
+    """Aggregates all morphological, geometric, and helical algorithms into a final exportable dataset."""
+    max_aortic_diameter = whole_raw["Dfit"].max()
+    mean_aortic_diameter = whole_raw["Dfit"].mean()
+    
+    # 1. Distances (Using RAW, unscaled coordinates for absolute mm)
+    whole_dist_mm = calculate_arc_length(whole_raw)
+    fl_dist_mm = calculate_arc_length(fl_raw)
+    tl_dist_mm = calculate_arc_length(tl_raw)
+    
+    # 2. Geometric Complexity & Tortuosity
+    whole_tort = calculate_tortuosity(whole_raw)
+    whole_curve = calculate_mean_curvature(whole_raw, whole_dist_mm)
+    
+    # 3. Surface Area & Volume Estimation (Frustum Integration)
+    fl_vol = calculate_volume(fl_raw["Area"], fl_dist_mm)
+    tl_vol = calculate_volume(tl_raw["Area"], tl_dist_mm)
+    vol_ratio = tl_vol / fl_vol if fl_vol > EPSILON else np.nan
+    area_ratio = tl_raw["Area"].mean() / fl_raw["Area"].mean() if fl_raw["Area"].mean() > EPSILON else np.nan
+    
+    # 4. Lumen Interaction Metrics (The "Braid" Analysis)
+    fl_plane = lumen_points(aorta, FL, search_radius)
+    tl_plane = lumen_points(aorta, TL, search_radius)
+    
+    # Convert standardized centroid coordinates back to absolute mm for distance calculations
+    P_whole = aorta[["Px", "Py", "Pz"]].to_numpy(dtype=float) * scale_val
+    P_fl = fl_plane[["Px", "Py", "Pz"]].to_numpy(dtype=float) * scale_val
+    P_tl = tl_plane[["Px", "Py", "Pz"]].to_numpy(dtype=float) * scale_val
+    
+    fl_eccentricity = np.nanmean(np.linalg.norm(P_fl - P_whole, axis=1))
+    tl_eccentricity = np.nanmean(np.linalg.norm(P_tl - P_whole, axis=1))
+    inter_lumen_dist = np.nanmean(np.linalg.norm(P_fl - P_tl, axis=1))
+
+    # 5. Advanced Helical Metrics (Using Polar Method)
+    fl_polar = helical_angle_polar(aorta, FL, search_radius)
+    tl_polar = helical_angle_polar(aorta, TL, search_radius)
+
+    # 6. Advanced Helical Metrics (Using Fiducial Method)
+    fl_fiducial = helical_angle_fiducial(aorta, FL, point_coords, scale_val, search_radius)
+    tl_fiducial = helical_angle_fiducial(aorta, TL, point_coords, scale_val, search_radius)
+    
+    # Only calculate metrics where BOTH lumens physically exist in the slice
+    overlap_mask = ~np.isnan(fl_fiducial) & ~np.isnan(tl_fiducial)
+    
+    # Apply the mask to isolate the true dissection zone (Fiducial)
+    fl_fiducial_zone = np.where(overlap_mask, fl_fiducial, np.nan)
+    tl_fiducial_zone = np.where(overlap_mask, tl_fiducial, np.nan)
+
+    # Apply the mask to isolate the true dissection zone (Polar)
+    fl_polar_zone = np.where(overlap_mask, fl_polar, np.nan)
+    tl_polar_zone = np.where(overlap_mask, tl_polar, np.nan)
+
+    # Calculate metrics ONLY within the valid dissection zone (Polar)
+    fl_mean_pol, fl_avg_tw_pol, fl_sd_tw_pol, fl_peak_tw_pol, _, _ = extract_metrics(fl_polar_zone, whole_dist_mm)
+    tl_mean_pol, tl_avg_tw_pol, tl_sd_tw_pol, tl_peak_tw_pol, _, _ = extract_metrics(tl_polar_zone, whole_dist_mm)
+    
+    # Calculate metrics ONLY within the valid dissection zone (Fiducial)
+    fl_mean_fid, fl_avg_tw_fid, fl_sd_tw_fid, fl_peak_tw_fid, fl_max_pos, fl_max_neg = extract_metrics(fl_fiducial_zone, whole_dist_mm)
+    tl_mean_fid, tl_avg_tw_fid, tl_sd_tw_fid, tl_peak_tw_fid, tl_max_pos, tl_max_neg = extract_metrics(tl_fiducial_zone, whole_dist_mm)
+    
+    # Pitch and Chirality Mapping
+    fl_pitch = (360.0 / abs(fl_avg_tw_fid)) if abs(fl_avg_tw_fid) > EPSILON else np.nan
+    fl_chirality = determine_chirality(fl_max_pos, fl_max_neg, threshold=0.5)
+    
+    tl_pitch = (360.0 / abs(tl_avg_tw_fid)) if abs(tl_avg_tw_fid) > EPSILON else np.nan
+    tl_chirality = determine_chirality(tl_max_pos, tl_max_neg, threshold=0.5)
+    
+    # Compile into structured dictionary
+    data = {
+        # Diameter
+        "Max Aortic Diameter (mm)": max_aortic_diameter,
+        "Mean Aortic Diameter (mm)": mean_aortic_diameter,
+ 
+        # Global Complexity
+        "Tortuosity Index": whole_tort,
+        "Mean Curvature (1/mm)": whole_curve,
+        
+        # Volumetric & Area Interactions
+        "TL Volume (mm3)": tl_vol,
+        "FL Volume (mm3)": fl_vol,
+        "TL/FL Volume Ratio": vol_ratio,
+        "TL/FL Mean Area Ratio": area_ratio,
+        
+        # Spatial Eccentricity
+        "Mean Inter-Lumen Dist (mm)": inter_lumen_dist,
+        "TL Eccentricity (mm)": tl_eccentricity,
+        "FL Eccentricity (mm)": fl_eccentricity,
+        
+        # False Lumen Helix (Fiducial)
+        "FL Avg Twist Fiducial (deg/mm)": fl_avg_tw_fid,
+        "FL Twist SD (deg/mm)": fl_sd_tw_fid,
+        "FL Peak Twist Fiducial (deg/mm)": fl_peak_tw_fid,
+        "FL Spiral Pitch (mm)": fl_pitch,
+        "FL Chirality": fl_chirality,
+        
+        # False Lumen Helix (Polar - For Validation)
+        "FL Avg Twist Polar (deg/mm)": fl_avg_tw_pol,
+        
+        # True Lumen Helix (Fiducial)
+        "TL Avg Twist Fiducial (deg/mm)": tl_avg_tw_fid,
+        "TL Twist SD (deg/mm)": tl_sd_tw_fid,
+        "TL Peak Twist Fiducial (deg/mm)": tl_peak_tw_fid,
+        "TL Spiral Pitch (mm)": tl_pitch,
+        "TL Chirality": tl_chirality,
+        
+        # True Lumen Helix (Polar - For Validation)
+        "TL Avg Twist Polar (deg/mm)": tl_avg_tw_pol,
+    }
+    
+    if make_plots == True:
+        fiducial = fiducial_line(whole_aorta, point_coords, scale_val)
+        plots(batch_id, aorta, TL, fiducial, step=5)
+    return pd.DataFrame(data, index=[0])
+
+# --- 3D Visualization ---
+def plots(batch_id, dataframe1, dataframe2, dataframe3, step=5):
+    """Generates a 3D scatter plot of the extracted whole aorta, lumen, and fiducial guideline."""
+    fig = plt.figure(figsize=(9, 9))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # 1. Continuous lines
+    ax.plot(dataframe1.iloc[:, 0], dataframe1.iloc[:, 1], dataframe1.iloc[:, 2], c="k", linewidth=2, label="Whole Aorta")
+    ax.plot(dataframe2.iloc[:, 0], dataframe2.iloc[:, 1], dataframe2.iloc[:, 2], c="g", linewidth=1.5, linestyle="--", label="Fiducial")
+    ax.plot(dataframe3.iloc[:, 0], dataframe3.iloc[:, 1], dataframe3.iloc[:, 2], c="b", linewidth=1.8, label="FL/TL")
+
+    # 2. Subsampled scatter points
+    sub1 = dataframe1.iloc[::step]
+    sub2 = dataframe2.iloc[::step]
+    sub3 = dataframe3.iloc[::step]
+
+    ax.scatter(sub1.iloc[:, 0], sub1.iloc[:, 1], sub1.iloc[:, 2], c="k", marker="x", s=20)
+    ax.scatter(sub2.iloc[:, 0], sub2.iloc[:, 1], sub2.iloc[:, 2], c="g", marker="o", s=15)
+    ax.scatter(sub3.iloc[:, 0], sub3.iloc[:, 1], sub3.iloc[:, 2], c="b", marker="^", s=20)
+
+    # 3. Enforce true 1:1:1 equal aspect ratio to prevent box distortion
+    all_x = np.concatenate([dataframe1.iloc[:, 0], dataframe2.iloc[:, 0], dataframe3.iloc[:, 0]])
+    all_y = np.concatenate([dataframe1.iloc[:, 1], dataframe2.iloc[:, 1], dataframe3.iloc[:, 1]])
+    all_z = np.concatenate([dataframe1.iloc[:, 2], dataframe2.iloc[:, 2], dataframe3.iloc[:, 2]])
+
+    max_range = np.array([
+        all_x.max() - all_x.min(),
+        all_y.max() - all_y.min(),
+        all_z.max() - all_z.min()
+    ])
+    
+    mid_x = (all_x.max() + all_x.min()) * 0.5
+    mid_y = (all_y.max() + all_y.min()) * 0.5
+    mid_z = (all_z.max() + all_z.min()) * 0.5
+    radius = 0.5 * max_range.max()
+
+    ax.set_xlim(mid_x - radius, mid_x + radius)
+    ax.set_ylim(mid_y - radius, mid_y + radius)
+    ax.set_zlim(mid_z - radius, mid_z + radius)
+
+    ax.set_box_aspect((max_range[0] / max_range.max(),
+                       max_range[1] / max_range.max(),
+                       max_range[2] / max_range.max()))
+
+    ax.set_xlabel("X (norm)")
+    ax.set_ylabel("Y (norm)")
+    ax.set_zlabel("Z (norm)")
+    ax.legend(loc="upper right")
+    plt.tight_layout()
+    
+    # Create the directory if it doesn't exist
+    plot_dir = "Plots"
+    if not os.path.exists(plot_dir):
+        os.makedirs(plot_dir)
+        
+    # Save the figure with the patient ID as the filename
+    filepath = os.path.join(plot_dir, f"{batch_id}_plot.png")
+    plt.savefig(filepath, dpi=150)
+    print(f"Saved plot: {filepath}")
+    
+    # Close the figure to prevent the memory leak!
+    plt.close(fig)
+
+    
+# --- Main Execution Pipeline ---
+if __name__ == "__main__":
+    
+    target_directory = "." # Change if your files are in a specific folder, e.g., "./data"
+    batches = get_file_batches(target_directory)
+    
+    if not batches:
+        print("No complete file batches found in the directory.")
+    else:
+        print(f"Found {len(batches)} complete datasets to process.")
+        
+    all_results = []
+    
+    for batch_id, files in batches.items():
+        print(f"Processing Dataset: {batch_id}...")
+        try:
+            # 1. Load Data
+            point_coordinates_raw = extract_fiducial_point(files['Whole'])
+            whole_raw = load_centerline(files['Whole'], sigma_cutoff=3.0)
+            FL_raw = load_centerline(files['FL'], sigma_cutoff=3.0)
+            TL_raw = load_centerline(files['TL'], sigma_cutoff=5.0)
+
+            # 2. Orient and Standardize
+            whole_raw = orient_proximal_to_distal(whole_raw, point_coordinates_raw)
+            FL_raw = orient_proximal_to_distal(FL_raw, point_coordinates_raw)
+            TL_raw = orient_proximal_to_distal(TL_raw, point_coordinates_raw)
+
+            whole_aorta, FL_aorta, TL_aorta, point_coords, scale_val = standardize_coordinates(
+                whole_raw, FL_raw, TL_raw, point_coordinates_raw, scale_by="diameter"
+            )
+
+            normalized_search_radius = DISTANCE_TOLERANCE / scale_val
+            
+            # 3. Compute Metrics
+            df_result = csv(
+                batch_id,
+                whole_aorta,
+                FL_aorta,
+                TL_aorta,
+                point_coords,
+                scale_val=scale_val,
+                search_radius=normalized_search_radius,
+                whole_raw=whole_raw,
+                fl_raw=FL_raw,       
+                tl_raw=TL_raw,
+                make_plots=True
+            )
+            
+            # Insert ID for tracking in R
+            df_result.insert(0, "Patient_ID", batch_id)
+            all_results.append(df_result)
+            
+        except Exception as e:
+            print(f"  -> Error processing {batch_id}: {e}")
+            
+    # 4. Compile and Export
+    if all_results:
+        final_dataframe = pd.concat(all_results, ignore_index=True)
+        final_dataframe.to_csv("batch_output.csv", index=False)
+        print(f"\nBatch complete. Successfully processed {len(all_results)} datasets. Saved to 'batch_output.csv'")
